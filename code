@@ -1,0 +1,230 @@
+import numpy as np
+import pandas as pd
+from rdkit import Chem
+from rdkit.Chem import Descriptors
+from tqdm import tqdm
+from chembl_webresource_client.new_client import new_client
+from itertools import islice
+from rdkit.Chem import MolFromSmiles
+from rdkit.Chem import rdFingerprintGenerator
+import xgboost as xgb
+from xgboost import XGBClassifier 
+from sklearn.metrics import (classification_report, accuracy_score, 
+                             roc_auc_score, confusion_matrix, ConfusionMatrixDisplay)
+from sklearn.model_selection import train_test_split, GridSearchCV, StratifiedKFold
+import os
+import seaborn as sns
+import matplotlib.pyplot as plt
+from rdkit.Chem import AllChem, Draw
+from sklearn.utils.class_weight import compute_sample_weight
+import warnings
+warnings.filterwarnings('ignore')
+
+# 配置可视化参数
+plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['axes.unicode_minus'] = False
+sns.set(style='whitegrid', font_scale=1.2)
+
+# --------------------------
+# 1. 目标搜索与验证
+# --------------------------
+target_name = "ITGA4/ITGB1"
+targets = new_client.target.search(target_name)
+targets = list(islice(targets, 10))  # 转换为列表以便复用
+
+if not targets:
+    raise ValueError(f"未找到目标: {target_name}")
+
+print("候选ChEMBL ID:")
+for t in targets:
+    print(f"{t['target_chembl_id']} - {t['pref_name']}")
+
+# 使用首个有效目标
+target_chembl_id = targets[0]['target_chembl_id']
+print(f"\n选择目标: {target_chembl_id}")
+
+# --------------------------
+# 2. 数据获取与预处理
+# --------------------------
+activities = new_client.activity.filter(
+    target_chembl_id=target_chembl_id, 
+    standard_type="IC50",
+    relation="=",  # 精确匹配
+    standard_units="nM"  # 确保单位一致
+)
+
+df = pd.DataFrame(activities)
+print(f"\n原始数据量: {len(df)}")
+
+# 关键字段过滤
+df = df[['molecule_chembl_id', 'canonical_smiles', 'standard_value', 'standard_units']]
+df = df.dropna(subset=['canonical_smiles', 'standard_value']).drop_duplicates(subset='molecule_chembl_id')
+
+# 数值有效性检查
+df['standard_value'] = pd.to_numeric(df['standard_value'], errors='coerce')
+df = df[df['standard_value'].between(1e-3, 1e6)]  # 过滤极端值
+print(f"有效数据量: {len(df)}")
+
+# pIC50转换
+df['pIC50'] = -np.log10(df['standard_value'] * 1e-9)
+df['activity_class'] = df['pIC50'].apply(lambda x: 'active' if x >= 6 else 'inactive')
+
+# 类别分布分析
+class_dist = df['activity_class'].value_counts(normalize=True)
+print(f"\n类别分布:\n{class_dist}")
+
+
+# 3. 特征工程
+from tqdm import tqdm
+tqdm.pandas() 
+generator = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
+
+def safe_smiles_to_fingerprint(smiles):
+    try:
+        mol = MolFromSmiles(smiles)
+        if mol:
+            return np.array(generator.GetFingerprint(mol).ToList())
+        return None
+    except:
+        return None
+
+df['fingerprint'] = df['canonical_smiles'].progress_apply(safe_smiles_to_fingerprint)
+df = df.dropna(subset=['fingerprint'])
+
+
+# 4. 数据准备
+# --------------------------
+X = np.stack(df['fingerprint'].values)
+y = df['activity_class'].map({'active':1, 'inactive':0}).values
+
+# Stratified split
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, 
+    test_size=0.2, 
+    stratify=y,
+    random_state=42
+)
+
+# Class weights
+sample_weights = compute_sample_weight('balanced', y_train)
+
+# 5. 模型构建优化
+# --------------------------
+param_grid = {
+    'max_depth': [3, 5, 7],
+    'n_estimators': [100, 200, 300],
+    'learning_rate': [0.01, 0.1],
+    'subsample': [0.7, 0.9],
+    'colsample_bytree': [0.7, 0.9],
+    'gamma': [0, 0.1]
+}
+
+model = XGBClassifier(
+    objective='binary:logistic', 
+    eval_metric=['logloss', 'auc'],
+    use_label_encoder=False,
+    early_stopping_rounds=10
+)
+
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+grid_search = GridSearchCV(
+    estimator=model,
+    param_grid=param_grid,
+    cv=cv,
+    scoring='roc_auc',
+    verbose=2,
+    n_jobs=-1
+)
+
+print("\nStarting grid search...")
+grid_search.fit(
+    X_train, y_train,
+    eval_set=[(X_test, y_test)],
+    sample_weight=sample_weights,
+    verbose=False
+)
+
+# Best model evaluation
+best_model = grid_search.best_estimator_
+y_pred = best_model.predict(X_test)
+y_proba = best_model.predict_proba(X_test)[:,1]
+
+print(f"\nBest parameters: {grid_search.best_params_}")
+print(f"Test accuracy: {accuracy_score(y_test, y_pred):.3f}")
+print(f"Test AUC: {roc_auc_score(y_test, y_proba):.3f}")
+print("\nClassification report:")
+print(classification_report(y_test, y_pred, target_names=['inactive', 'active']))
+
+
+import os
+ 
+desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
+save_path = os.path.join(desktop_path, "best_xgboost_model.json")
+
+model.save_model(save_path)
+print(f"模型已保存到：{save_path}")
+
+
+# 6. 特征可视化（这部分效果不太好，不知道怎么优化）
+# --------------------------
+# Feature importance
+fig, ax = plt.subplots(figsize=(10,6))
+xgb.plot_importance(best_model, ax=ax, max_num_features=20)
+plt.title('Top 20 Feature Importance')
+plt.tight_layout()
+plt.savefig('feature_importance.png')
+plt.show()
+
+# Confusion matrix
+cm = confusion_matrix(y_test, y_pred, labels=[0,1])
+disp = ConfusionMatrixDisplay(cm, display_labels=['inactive','active'])
+disp.plot(cmap='Blues')
+plt.title('Confusion Matrix')
+plt.savefig('confusion_matrix.png')
+plt.show()
+
+
+# 7. 化合物预测（示例）
+# --------------------------
+sample_smiles = [
+    'CC(C)C[C@H](NC(=O)CC1=CC=C(NC(=O)NC2=C(C)C=CC=C2)C=C1)C(=O)N[C@@H](CC(O)=O)C(=O)N[C@@H](C(C)C)C(=O)N1CCC[C@H]1C(O)=O',  # BIO1211
+    'CCOCNOCC',  # Invalid test case
+    'CC(=O)N1CSC[C@@H]1C(=O)N[C@@H](Cc1ccc(OCc2c(Cl)cc(Cl)cc2Cl)cc1)C(=O)O'  # pIC50 = 8
+]
+
+results = []
+print("\nPredicting new compounds:")
+for smi in tqdm(sample_smiles, desc="Compound prediction"):
+    fp = safe_smiles_to_fingerprint(smi)
+    if fp is not None:
+        proba = best_model.predict_proba([fp])[0]
+        results.append({
+            'SMILES': smi,
+            'Prediction': 'active' if proba[1] > 0.5 else 'inactive',
+            'Inactive_Prob': proba[0],
+            'Active_Prob': proba[1]
+        })
+    else:
+        results.append({
+            'SMILES': smi,
+            'Prediction': 'Invalid',
+            'Inactive_Prob': np.nan,
+            'Active_Prob': np.nan
+        })
+
+result_df = pd.DataFrame(results)
+print("\nPrediction results:")
+print(result_df)
+
+
+# 8. 保存结果
+# --------------------------
+desktop_path = os.path.join(os.path.expanduser('~'), 'Desktop')
+result_path = os.path.join(desktop_path, 'activity_predictions.csv')
+result_df.to_csv(result_path, index=False)
+print(f"\nResults saved to: {result_path}")
+
+# Save model
+model_path = os.path.join(desktop_path, 'best_xgboost_model.json')
+best_model.save_model(model_path)
+print(f"Model saved to: {model_path}")
